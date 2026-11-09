@@ -34,12 +34,22 @@ event_study/
                        known event date (earnings, an outage...) vs a benchmark, with a t-stat
                        reliability gate. Data-pull half follows Massive's own CrowdStrike tutorial;
                        the abnormal-return math on top of it is this project's own.
+  event_library.py   - a growing CSV catalog of past events (events.csv), plus cross-event
+                       comparison on top of study.py: event_sample_study() averages the day-by-day
+                       reaction across every logged event of a type (the "signature"); match_new_case()
+                       compares a live, unresolved case against that signature.
+
+anomaly/
+  detector.py        - trade-count anomaly detector: flags S&P 500 stocks whose trade count today is
+                       a z-score outlier against their own trailing 5-day baseline. Follows Massive's
+                       "Hunting Anomalies in the Stock Market" tutorial, adapted to pull through the
+                       REST grouped-daily-aggregates endpoint instead of bulk Flat Files.
 
 shared/
   config.py          - credentials, folders
 
 app.py               - Signal Desk: the combined Streamlit front end (Dark Pool, FINRA, Analysis,
-                       NOI, After-Market Event Analysis tabs)
+                       NOI, After-Market Event Analysis, Anomaly Detector tabs)
 ```
 
 ## Running things
@@ -60,6 +70,14 @@ uv run python -m dark_pool.live --ticker NVDA TSLA
 # After-market event study, on its own
 uv run python -m event_study.study --symbol CRWD --event-date 2024-07-19
 uv run python -m event_study.study --symbol GOOGL --event-date 2026-10-28 --baseline SPY
+
+# Event library - log an event, build a cross-event signature, match a live case
+uv run python -m event_study.event_library --add --symbol SYM --event-date YYYY-MM-DD --event-type cybersecurity_breach
+uv run python -m event_study.event_library --signature --event-type cybersecurity_breach
+uv run python -m event_study.event_library --match --symbol SYM --event-type cybersecurity_breach --as-of YYYY-MM-DD
+
+# Anomaly detector, on its own
+uv run python -m anomaly.detector --scan
 ```
 
 ## How the FINRA data actually works (confirmed against the real API, not just docs)

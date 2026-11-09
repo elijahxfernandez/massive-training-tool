@@ -1,0 +1,15 @@
+symbol,event_date,event_type,baseline,notes
+CRWD,2024-07-19,outage,SPY,Falcon sensor update bricked Windows machines worldwide; CAR confirmed against the tutorial's own published numbers.
+GOOGL,2026-10-28,earnings_miss,SPY,"Q3 2026 earnings reaction (reports after close 10-28, reaction shows 10-29); CAR -10.17%, t=-2.22, reliable."
+MSFT,2026-10-28,earnings_beat,SPY,"Same earnings date as GOOGL above; CAR -0.95%, t=-0.17, NOT reliable - noise, not a real reaction."
+EFX,2017-09-08,cybersecurity_breach,SPY,Equifax disclosed the breach after close on 9/7/2017; reaction shows 9/8.
+MGM,2023-09-12,cybersecurity_breach,SPY,MGM Resorts disclosed an active cyberattack disrupting casino/hotel systems starting 9/11/2023.
+UNH,2024-02-22,cybersecurity_breach,SPY,"Change Healthcare (UNH subsidiary) cyberattack disclosed 2/21/2024; smaller reaction since it's a subsidiary, not core UNH revenue."
+SWI,2020-12-14,cybersecurity_breach,SPY,SolarWinds supply-chain breach disclosed 12/13/2020 (Sunday); reaction shows Monday 12/14.
+NFLX,2022-01-20,earnings_miss,SPY,"Q4 2021 subscriber growth miss, reported after close 1/19/2022; stock fell ~22% the next day."
+META,2022-02-03,guidance_cut,SPY,"Q4 2021 earnings + weak guidance (Reels competition, user decline warning), reported after close 2/2/2022; stock fell ~26% the next day, largest single-day market-cap loss at the time."
+BA,2019-03-13,regulatory_action,SPY,FAA grounded the entire 737 MAX fleet 3/13/2019 after the Ethiopian Airlines crash.
+WFC,2019-03-29,exec_departure,SPY,CEO Tim Sloan resigned 3/28/2019 amid ongoing regulatory scrutiny; reaction shows 3/29.
+PTON,2021-05-05,product_recall,SPY,Recalled Tread+ treadmills 5/5/2021 after a child's death and dozens of injury reports.
+ATVI,2022-01-18,merger_announcement,SPY,Microsoft announced its ~68.7B dollar acquisition of Activision Blizzard 1/18/2022; stock jumped toward the deal price.
+BIIB,2021-06-07,fda_decision,SPY,"FDA approved Aduhelm (aducanumab) for Alzheimer's 6/7/2021, despite its own advisory panel's objections; stock spiked."

@@ -104,6 +104,7 @@ def event_study(symbol: str, event_date: str, baseline: str = DEFAULT_BASELINE,
 
     model = fit_market_model(estimation["ret_sym"], estimation["ret_base"])
     event = event.copy()
+    event["relative_day"] = range(event_start - event_idx, event_end - event_idx)
     event["expected_ret"] = model["alpha"] + model["beta"] * event["ret_base"]
     event["abnormal_ret"] = event["ret_sym"] - event["expected_ret"]
 
@@ -116,7 +117,7 @@ def event_study(symbol: str, event_date: str, baseline: str = DEFAULT_BASELINE,
         "alpha": round(model["alpha"], 4), "beta": round(model["beta"], 3), "n_estimation_days": model["n"],
         "car_pct": round(float(car), 3), "t_stat": round(float(t_stat), 2) if t_stat == t_stat else None,
         "reliable": bool(abs(t_stat) >= 2) if t_stat == t_stat else False,
-        "event_window": event[["date", "ret_sym", "ret_base", "expected_ret", "abnormal_ret"]].round(3),
+        "event_window": event[["date", "relative_day", "ret_sym", "ret_base", "expected_ret", "abnormal_ret"]].round(3),
     }
 
 

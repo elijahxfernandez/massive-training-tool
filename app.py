@@ -16,7 +16,11 @@ Tabs:
                just reads its CSV/JSON output the same way its own dashboard does)
   After-Market Event Analysis - abnormal return around a known event date (earnings, an outage,
                guidance...) vs a benchmark, with a market-model t-stat reliability
-               gate (event_study/study.py)
+               gate (event_study/study.py), plus a cross-event signature and a
+               live-case matcher built on a growing event library (event_study/event_library.py)
+  Anomaly Detector - today's trade-count outliers across the S&P 500 (z-score vs
+               each stock's own trailing 5-day baseline), following Massive's
+               "Hunting Anomalies in the Stock Market" tutorial (anomaly/detector.py)
 """
 
 from pathlib import Path
@@ -27,9 +31,11 @@ import streamlit as st
 
 from dark_pool.analysis import MIN_ROWS_FOR_TEST, participation_series, predict_this_week, reversal_test
 from event_study.study import DEFAULT_BASELINE, DEFAULT_ESTIMATION_DAYS, DEFAULT_WINDOW, event_study
+from event_study.event_library import EVENT_TYPES, add_event, event_sample_study, load_events, match_new_case
 from dark_pool.finra.collect import FINRA_DIR
 from dark_pool.live import available_days as live_available_days, todays_outliers
 from dark_pool.scanner import available_weeks, top_symbols
+from anomaly.detector import DEFAULT_THRESHOLD as ANOMALY_DEFAULT_THRESHOLD, scan as anomaly_scan
 
 CONSTITUENTS_PATH = FINRA_DIR.parent.parent / "reference_data" / "sp500_constituents.csv"
 
@@ -134,8 +140,9 @@ def noi_available_days() -> list[str]:
 st.title("Signal Desk")
 st.caption("Two off-exchange signal tools, one dashboard: dark pool (FINRA TRF) prints and NYSE order imbalance auctions.")
 
-tab_dark, tab_finra, tab_analysis, tab_noi, tab_event = st.tabs(
-    ["Dark Pool (Live)", "FINRA (Free, Weekly)", "Analysis", "NOI (Order Imbalance)", "After-Market Event Analysis"]
+tab_dark, tab_finra, tab_analysis, tab_noi, tab_event, tab_anomaly = st.tabs(
+    ["Dark Pool (Live)", "FINRA (Free, Weekly)", "Analysis", "NOI (Order Imbalance)",
+     "After-Market Event Analysis", "Anomaly Detector"]
 )
 
 # ---------------------------------------------------------------------------
@@ -427,3 +434,164 @@ with tab_event:
                     "up/down that day.' The t-stat tests whether that CAR is distinguishable from noise; |t| < 2 "
                     "means treat it as exploratory, not a confirmed finding."
                 )
+
+    st.divider()
+    st.subheader("Event library")
+    st.caption("Everything above looks at ONE event. Logging events of the same type here lets the next two "
+               "sections compare across many of them - a cross-event signature, and a check of whether a "
+               "live, unresolved case resembles that signature so far.")
+
+    with st.expander("➕ Add an event to the library"):
+        el1, el2, el3 = st.columns(3)
+        lib_symbol = el1.text_input("Symbol", value="", key="lib_add_symbol").upper()
+        lib_event_type = el2.selectbox("Event type", options=EVENT_TYPES, key="lib_add_type")
+        lib_event_date = el3.date_input("Event date", value=pd.Timestamp.today(), key="lib_add_date")
+        lib_baseline_label = st.selectbox("Baseline / benchmark", options=list(BENCHMARKS.keys()), key="lib_add_baseline")
+        lib_notes = st.text_area("Notes (what happened)", key="lib_add_notes")
+        if st.button("Add to library", disabled=not lib_symbol):
+            add_event(lib_symbol, lib_event_date.strftime("%Y-%m-%d"), lib_event_type, BENCHMARKS[lib_baseline_label], lib_notes)
+            st.success(f"Logged {lib_symbol} / {lib_event_date} / {lib_event_type}.")
+
+    with st.expander(f"📒 Current library ({len(load_events())} events)"):
+        st.dataframe(load_events(), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Cross-event signature")
+    st.caption("Runs the same event study above once per logged event of a type, then averages the day-by-day "
+               "abnormal return across all of them - the typical shape of the reaction for that kind of event.")
+    sig_types = sorted(load_events()["event_type"].unique())
+    sig_event_type = st.selectbox("Event type", options=sig_types, key="sig_event_type")
+    if st.button("Build signature"):
+        try:
+            sig_result = event_sample_study(sig_event_type)
+        except SystemExit as e:
+            st.error(str(e))
+            sig_result = None
+        if sig_result:
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Events in sample", sig_result["n_events"])
+            s2.metric("Reliable (|t| ≥ 2)", f"{sig_result['n_reliable']}/{sig_result['n_events']}")
+            s3.metric("Average CAR", f"{sig_result['avg_car_pct']:+.2f}%" if sig_result["avg_car_pct"] is not None else "—")
+            if sig_result["n_events"] < 4:
+                st.warning("Small sample - this signature is a rough average, not a trained model. Add more "
+                           "events of this type to firm it up.")
+
+            sig_df = sig_result["signature"]
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=sig_df["relative_day"], y=sig_df["mean_abnormal_ret"],
+                                  error_y=dict(array=sig_df["std_abnormal_ret"]),
+                                  marker_color=[DOWN if v < 0 else UP for v in sig_df["mean_abnormal_ret"]],
+                                  name="Mean abnormal return"))
+            fig.update_layout(**PLOTLY_LAYOUT,
+                               title=plot_title(f"{sig_event_type} - average abnormal return by day (n={sig_result['n_events']})"),
+                               height=420, xaxis_title="Day relative to event (0 = event day)",
+                               yaxis_title="Mean abnormal return (%)")
+            fig.update_yaxes(ticksuffix="%", tickfont=dict(color=INK, size=13))
+            fig.update_layout(margin=dict(t=60, l=60, r=10, b=60))
+            st.plotly_chart(fig, use_container_width=True, theme=None)
+            st.dataframe(sig_df.rename(columns={
+                "relative_day": "Day", "mean_abnormal_ret": "Mean Abnormal Return %",
+                "std_abnormal_ret": "Std Dev %", "n": "N Events",
+            }), use_container_width=True, hide_index=True)
+            with st.expander("Per-event scorecard"):
+                st.dataframe(sig_result["scorecard"], use_container_width=True, hide_index=True)
+
+    st.markdown("#### Match a live case")
+    st.caption("No confirmed event date needed - pick an as-of date (today, or the last close) and see how that "
+               "symbol's trajectory so far compares to the historical signature above. This is a resemblance "
+               "score, not a prediction: with only a few historical analogs per type, treat it as a lead to "
+               "investigate, not a signal to act on by itself.")
+    m1, m2, m3 = st.columns(3)
+    match_symbol = m1.text_input("Symbol", value="", key="match_symbol").upper()
+    match_event_type = m2.selectbox("Suspected event type", options=sig_types, key="match_event_type")
+    match_as_of = m3.date_input("As-of date", value=pd.Timestamp.today(), key="match_as_of")
+    if st.button("Compare to signature", disabled=not match_symbol):
+        try:
+            match_result = match_new_case(match_symbol, match_event_type, match_as_of.strftime("%Y-%m-%d"))
+        except SystemExit as e:
+            st.error(str(e))
+            match_result = None
+        if match_result:
+            mc1, mc2 = st.columns(2)
+            mc1.metric("Historical analogs", match_result["n_signature_events"])
+            score = match_result["similarity_score"]
+            mc2.metric("Similarity score (avg z vs signature)", f"{score:+.2f}" if score is not None else "n/a (sample too small)")
+            st.dataframe(match_result["comparison"].rename(columns={
+                "relative_day": "Day", "date": "Date", "abnormal_ret": f"{match_symbol} Abnormal Return %",
+                "mean_abnormal_ret": "Signature Mean %", "std_abnormal_ret": "Signature Std Dev %",
+                "n": "N Events", "z_vs_signature": "Z vs Signature",
+            }), use_container_width=True, hide_index=True)
+            st.caption("Only days up to and including the as-of date are shown - the days after it haven't "
+                       "happened yet, so there's nothing to compare there.")
+
+# ---------------------------------------------------------------------------
+with tab_anomaly:
+    st.caption("Flags S&P 500 stocks whose trade count today is a statistical outlier against their OWN "
+               "recent normal - not against each other. Follows Massive's \"Hunting Anomalies in the Stock "
+               "Market\" tutorial: https://massive.com/blog/hunting-anomalies-in-the-stock-market")
+
+    with st.expander("ℹ️ What is this and how does it work?"):
+        st.markdown(
+            "For each stock, this looks at its last 5 trading days' trade count (number of individual "
+            "trades, not shares) and computes **today's z-score** against that rolling mean/std: "
+            "`z = (today's trades - 5-day avg) / 5-day std dev`. A stock is flagged when `z` clears the "
+            "threshold below (the tutorial's own default is **3 standard deviations**) - i.e. today's "
+            "trade activity is far outside what's normal for THIS stock lately, regardless of what the "
+            "rest of the market is doing.\n\n"
+            "This is a volume/activity signal, not a price signal - price change is shown for context but "
+            "never used to decide whether something is flagged. **How this complements After-Market Event "
+            "Analysis:** that tool tells you how unusual a PRICE reaction was once you already know (or "
+            "suspect) what kind of event happened; this tool tells you something is unusual in trade "
+            "activity RIGHT NOW, often before you know why. A ticker flagged here is a reasonable next "
+            "candidate to run through the event library's 'Match a live case' above."
+        )
+
+    a1, a2 = st.columns(2)
+    anomaly_lookback = a1.slider("Lookback window (trading days to pull)", 10, 60, 30, key="anomaly_lookback")
+    anomaly_threshold = a2.slider("Z-score threshold", 1.5, 6.0, ANOMALY_DEFAULT_THRESHOLD, 0.5, key="anomaly_threshold")
+    anomaly_date_override = st.text_input(
+        "Target date override (YYYY-MM-DD, optional - default is the most recent pulled trading day)",
+        value="", key="anomaly_date_override",
+    )
+
+    if st.button("Scan for anomalies"):
+        anomaly_date_clean = anomaly_date_override.strip() or None
+        if anomaly_date_clean:
+            try:
+                pd.Timestamp(anomaly_date_clean)
+            except ValueError:
+                st.error(f"'{anomaly_date_clean}' isn't a valid date - use YYYY-MM-DD, or clear the field.")
+                st.stop()
+
+        with st.spinner("Pulling grouped daily data for the S&P 500 (one call per trading day)..."):
+            try:
+                anomaly_result = anomaly_scan(anomaly_lookback, anomaly_date_clean, anomaly_threshold)
+            except SystemExit as e:
+                st.error(str(e))
+                anomaly_result = None
+
+        if anomaly_result:
+            st.caption(f"Scanned {anomaly_result['n_scanned']} symbols for **{anomaly_result['target_date']}** "
+                       f"(threshold z > {anomaly_result['threshold']})")
+            flagged = anomaly_result["anomalies"]
+            if flagged.empty:
+                st.success("No anomalies flagged for this date at this threshold.")
+            else:
+                fig = go.Figure()
+                fig.add_trace(go.Bar(x=flagged["symbol"], y=flagged["z_score"],
+                                      marker_color=[DOWN if v < 0 else UP for v in flagged["price_diff_pct"]],
+                                      name="Z-score"))
+                fig.update_layout(**PLOTLY_LAYOUT,
+                                   title=plot_title(f"Trade-count anomalies - {anomaly_result['target_date']}"),
+                                   height=440, xaxis_title="Symbol", yaxis_title="Z-score (trade count vs own 5-day baseline)")
+                fig.update_xaxes(type="category", tickangle=-45, tickfont=dict(color=INK, size=12))
+                fig.update_yaxes(tickfont=dict(color=INK, size=13))
+                fig.update_layout(margin=dict(t=60, l=60, r=10, b=100))
+                st.plotly_chart(fig, use_container_width=True, theme=None)
+
+                st.dataframe(flagged.rename(columns={
+                    "symbol": "Symbol", "transactions": "Trades Today", "avg_trades": "5-Day Avg Trades",
+                    "std_trades": "5-Day Std Dev", "z_score": "Z-Score", "close": "Close",
+                    "price_diff_pct": "Price Change %",
+                }), use_container_width=True, hide_index=True)
+                st.caption("Bar color reflects today's price change (green = up, red = down) - a reminder "
+                           "that an activity spike alone doesn't say which direction, if any, price moved.")
