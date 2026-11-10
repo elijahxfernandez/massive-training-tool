@@ -24,6 +24,8 @@ it the same way it already is at the FINRA data.
 
 import argparse
 import csv
+import time
+import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -144,37 +146,59 @@ def main():
     out = DailyCsvWriter()
 
     feed = Feed.RealTime if args.realtime else Feed.Delayed
-    client = WebSocketClient(api_key=api_key(), feed=feed, market=Market.Stocks, subscriptions=subs)
+    # max_reconnects=None: same fix noi_tool/collector.py needed - without it,
+    # the SDK gives up and exits after a finite number of dropped connections,
+    # which an unattended all-day scheduled run will eventually hit.
+    client = WebSocketClient(api_key=api_key(), feed=feed, market=Market.Stocks, subscriptions=subs,
+                              max_reconnects=None)
 
     def handler(msgs):
+        # One malformed/unexpected message must not take down the whole feed -
+        # an uncaught exception here would propagate out of client.run() and
+        # kill the entire process.
         nonlocal cum_date
         for m in msgs:
-            if not isinstance(m, EquityTrade) or m.exchange != 4 or not m.trf_id:
-                continue  # exchange==4 + trf_id present = off-exchange/dark pool print
-            if m.price * m.size < args.min_notional:
-                continue
+            try:
+                if not isinstance(m, EquityTrade) or m.exchange != 4 or not m.trf_id:
+                    continue  # exchange==4 + trf_id present = off-exchange/dark pool print
+                if m.price * m.size < args.min_notional:
+                    continue
 
-            today = datetime.fromtimestamp(m.timestamp / 1000, tz=EASTERN).strftime("%Y-%m-%d")
-            if today != cum_date:
-                cum_shares.clear()
-                cum_date = today
+                today = datetime.fromtimestamp(m.timestamp / 1000, tz=EASTERN).strftime("%Y-%m-%d")
+                if today != cum_date:
+                    cum_shares.clear()
+                    cum_date = today
 
-            cum_shares[m.symbol] = cum_shares.get(m.symbol, 0) + m.size
-            symbol_adv = adv.get(m.symbol)
-            show_trade(m, cum_shares[m.symbol], symbol_adv)
+                cum_shares[m.symbol] = cum_shares.get(m.symbol, 0) + m.size
+                symbol_adv = adv.get(m.symbol)
+                show_trade(m, cum_shares[m.symbol], symbol_adv)
 
-            out.write({
-                "time_et": fmt_time(m.timestamp), "symbol": m.symbol,
-                "price": m.price, "size": m.size, "notional": round(m.price * m.size, 2),
-                "venue": TRF_NAMES.get(m.trf_id, f"TRF {m.trf_id}"), "trf_id": m.trf_id,
-                "cum_shares_today": cum_shares[m.symbol], "adv20": symbol_adv,
-                "participation_pct_of_adv": round(cum_shares[m.symbol] / symbol_adv * 100, 3) if symbol_adv else None,
-            }, today)
+                out.write({
+                    "time_et": fmt_time(m.timestamp), "symbol": m.symbol,
+                    "price": m.price, "size": m.size, "notional": round(m.price * m.size, 2),
+                    "venue": TRF_NAMES.get(m.trf_id, f"TRF {m.trf_id}"), "trf_id": m.trf_id,
+                    "cum_shares_today": cum_shares[m.symbol], "adv20": symbol_adv,
+                    "participation_pct_of_adv": round(cum_shares[m.symbol] / symbol_adv * 100, 3) if symbol_adv else None,
+                }, today)
+            except Exception as exc:
+                print(f"Skipped one malformed message ({type(exc).__name__}): {exc}", flush=True)
 
     delay_note = "real-time" if args.realtime else "15-min delayed"
     print(f"Dark pool scanner ({delay_note}, Massive) - {', '.join(subs)} - min notional ${args.min_notional:,.0f}", flush=True)
+    # Same crash-restart loop as noi_tool/collector.py: if client.run() still
+    # exits despite max_reconnects=None (an SDK-internal exception, a hard
+    # network failure...), restart the whole feed instead of exiting. A
+    # scheduled task's own execution-time limit remains the outer stop for the day.
     try:
-        client.run(handle_msg=handler)
+        while True:
+            try:
+                client.run(handle_msg=handler)
+                break
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                print(f"\nFeed crashed, restarting in 15s:\n{traceback.format_exc()}", flush=True)
+                time.sleep(15)
     except KeyboardInterrupt:
         pass
     finally:
