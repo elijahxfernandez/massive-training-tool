@@ -143,6 +143,11 @@ NOI_ROOT = Path(__file__).resolve().parent.parent / "NOI tool (order imbalance)"
 NOI_DATA_DIR = NOI_ROOT / "data"
 NOI_STATUS_PATH = NOI_DATA_DIR / "collector_status.json"
 
+# Same sibling-project convention as NOI, for the LULD price-band monitor.
+LULD_ROOT = Path(__file__).resolve().parent.parent / "luld-price-band-monitor"
+LULD_DATA_DIR = LULD_ROOT / "data"
+LULD_STATUS_PATH = LULD_DATA_DIR / "collector_status.json"
+
 
 @st.cache_data
 def load_constituents() -> pd.DataFrame:
@@ -158,12 +163,20 @@ def noi_available_days() -> list[str]:
     return sorted(p.stem for p in noi_dir.glob("*.csv"))
 
 
-st.title("Signal Desk")
-st.caption("Two off-exchange signal tools, one dashboard: dark pool (FINRA TRF) prints and NYSE order imbalance auctions.")
+def luld_available_days() -> list[str]:
+    luld_dir = LULD_DATA_DIR / "luld"
+    if not luld_dir.exists():
+        return []
+    return sorted(p.stem for p in luld_dir.glob("*.csv"))
 
-tab_dark, tab_finra, tab_analysis, tab_noi, tab_event, tab_anomaly, tab_insider = st.tabs(
+
+st.title("Signal Desk")
+st.caption("Several market-microstructure signal tools, one dashboard: dark pool (FINRA TRF) prints, "
+           "NYSE order imbalance auctions, LULD price bands, insider filings, and more.")
+
+tab_dark, tab_finra, tab_analysis, tab_noi, tab_luld, tab_event, tab_anomaly, tab_insider = st.tabs(
     ["Dark Pool (Live)", "FINRA (Free, Weekly)", "Analysis", "NOI (Order Imbalance)",
-     "After-Market Event Analysis", "Anomaly Detector", "Insider Indicator"]
+     "LULD (Price Bands)", "After-Market Event Analysis", "Anomaly Detector", "Insider Indicator"]
 )
 
 # ---------------------------------------------------------------------------
@@ -352,6 +365,56 @@ with tab_noi:
             st.plotly_chart(fig, use_container_width=True, theme=None)
             st.dataframe(
                 noi_df[["time_et", "symbol", "auction_type", "imbalance", "paired", "indicative_price"]]
+                .sort_values("time_et", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
+
+# ---------------------------------------------------------------------------
+with tab_luld:
+    st.caption("Limit Up-Limit Down price-band updates. Collector runs in the luld-price-band-monitor "
+               "project; this reads its output directly.")
+    st.caption("LULD bands are the exchange's recalculated price ceiling/floor for a symbol - a real "
+               "trading pause is reported on a separate status feed, not here, so this shows band "
+               "*behavior* (how tight, how often recalculated), not a halt call.")
+
+    if LULD_STATUS_PATH.exists():
+        status = pd.read_json(LULD_STATUS_PATH, typ="series")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Collector status", status.get("status", "unknown"))
+        c2.metric("Events logged (this run)", f"{status.get('events', 0):,}")
+        c3.metric("Last updated", str(status.get("updated", "-"))[:19])
+    else:
+        st.info("LULD collector hasn't run yet - no status file found.")
+
+    luld_days = luld_available_days()
+    if not luld_days:
+        st.warning("No LULD data yet. Start the collector in luld-price-band-monitor: "
+                   "`uv run python -m luld_tool.collector`")
+    else:
+        luld_day = st.selectbox("Day", options=list(reversed(luld_days)), index=0, key="luld_day")
+        luld_df = pd.read_csv(LULD_DATA_DIR / "luld" / f"{luld_day}.csv")
+        if luld_df.empty:
+            st.info("No LULD events logged for this day.")
+        else:
+            tightest = luld_df.dropna(subset=["band_width_pct"]).sort_values("band_width_pct").head(25)
+            if tightest.empty:
+                st.info("No priced band updates logged for this day.")
+            else:
+                fig = go.Figure(go.Bar(
+                    x=tightest["band_width_pct"][::-1] * 100, y=tightest["symbol"][::-1], orientation="h",
+                    marker_color=DOWN,
+                    hovertemplate="%{y}: %{x:.2f}%% band width<extra></extra>",
+                ))
+                fig.update_layout(**PLOTLY_LAYOUT,
+                                   title=plot_title(f"Tightest price bands - {luld_day}"),
+                                   height=max(320, 24 * len(tightest)),
+                                   xaxis_title="Band width (high - low) as % of midpoint",
+                                   yaxis_title="Symbol")
+                st.plotly_chart(fig, use_container_width=True, theme=None)
+                st.caption("Narrower bars mean less room before a 15-second excursion outside the band - "
+                           "the condition that can trigger a real trading pause, not a pause itself.")
+            st.dataframe(
+                luld_df[["time_et", "symbol", "high_price", "low_price", "band_width_pct", "indicators", "tape"]]
                 .sort_values("time_et", ascending=False),
                 use_container_width=True, hide_index=True,
             )
