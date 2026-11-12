@@ -21,9 +21,14 @@ Tabs:
   Anomaly Detector - today's trade-count outliers across the S&P 500 (z-score vs
                each stock's own trailing 5-day baseline), following Massive's
                "Hunting Anomalies in the Stock Market" tutorial (anomaly/detector.py)
+  Insider Indicator - COIN-only Form 3/4/13F ownership read vs price (sibling
+               insider-indicator-tool's indicator.py, imported directly - see the
+               sys.path note below for why that's fine here but not for NOI/dark_pool)
 """
 
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -36,6 +41,22 @@ from dark_pool.finra.collect import FINRA_DIR
 from dark_pool.live import available_days as live_available_days, todays_outliers
 from dark_pool.scanner import available_weeks, top_symbols
 from anomaly.detector import DEFAULT_THRESHOLD as ANOMALY_DEFAULT_THRESHOLD, scan as anomaly_scan
+
+# insider-indicator-tool is a separate sibling repo/project, with its own git
+# history and its own Flask/Postgres-only dependencies (Flask, psycopg) that this
+# app doesn't need and shouldn't require installing. Unlike NOI/dark_pool (which
+# this app reads as plain output files, never importing their code, specifically
+# to avoid depending on their .venv), indicator.py itself only imports pandas,
+# the massive SDK and python-dotenv - all already in THIS project's own venv - so
+# importing it directly (instead of re-implementing its analytics here) is safe:
+# no extra install, no dependency on insider-indicator-tool's own .venv/Flask/DB.
+INSIDER_ROOT = Path(__file__).resolve().parent.parent / "insider-indicator-tool"
+if str(INSIDER_ROOT) not in sys.path:
+    sys.path.insert(0, str(INSIDER_ROOT))
+import indicator as insider_indicator  # noqa: E402 (path must be set up first)
+# Same cache folder indicator.py's own CLI defaults to, so filings cached from
+# here are reused by (and reuse) runs of insider-indicator-tool's own CLI/Flask app.
+INSIDER_CACHE_DIR = INSIDER_ROOT / ".insider_cache"
 
 CONSTITUENTS_PATH = FINRA_DIR.parent.parent / "reference_data" / "sp500_constituents.csv"
 
@@ -140,9 +161,9 @@ def noi_available_days() -> list[str]:
 st.title("Signal Desk")
 st.caption("Two off-exchange signal tools, one dashboard: dark pool (FINRA TRF) prints and NYSE order imbalance auctions.")
 
-tab_dark, tab_finra, tab_analysis, tab_noi, tab_event, tab_anomaly = st.tabs(
+tab_dark, tab_finra, tab_analysis, tab_noi, tab_event, tab_anomaly, tab_insider = st.tabs(
     ["Dark Pool (Live)", "FINRA (Free, Weekly)", "Analysis", "NOI (Order Imbalance)",
-     "After-Market Event Analysis", "Anomaly Detector"]
+     "After-Market Event Analysis", "Anomaly Detector", "Insider Indicator"]
 )
 
 # ---------------------------------------------------------------------------
@@ -595,3 +616,113 @@ with tab_anomaly:
                 }), use_container_width=True, hide_index=True)
                 st.caption("Bar color reflects today's price change (green = up, red = down) - a reminder "
                            "that an activity spike alone doesn't say which direction, if any, price moved.")
+
+# ---------------------------------------------------------------------------
+with tab_insider:
+    st.caption("Coinbase (COIN) insider Form 3/4 ownership and reported P/S value vs price, plus an optional "
+               "single-manager 13F comparison - from the sibling insider-indicator-tool project.")
+
+    with st.expander("ℹ️ What is this and what does the signal mean?"):
+        st.markdown(
+            "**Form 3** is an insider's initial ownership disclosure; **Form 4** reports every later change, "
+            "including open-market/private **P**urchases and **S**ales. This reads Form 4 rows filed in the "
+            "chosen quarter, nets known purchase USD minus known sale USD, and compares that net's sign to the "
+            "quarter's price change (a ±2% move is treated as flat). When a single manager's SEC CIK and the "
+            "security's CUSIP are both given, a 13F quarter-end share comparison for that one manager is added "
+            "as a third input.\n\n"
+            "This is a **descriptive alignment of reported directions**, not a forecast, a valuation, or an "
+            "inferred investor motive - and it covers only one issuer (Coinbase) and, at most, one selected "
+            "institutional manager, never market-wide institutional breadth. Missing data becomes 'Insufficient "
+            "data' or a partial, two-input reading - it is never filled in with zero or guessed."
+        )
+
+    i1, i2, i3 = st.columns(3)
+    insider_previous_period = i1.date_input("Previous quarter end", value=pd.Timestamp("2026-03-31"), key="insider_previous_period")
+    insider_current_period = i2.date_input("Current quarter end", value=pd.Timestamp("2026-06-30"), key="insider_current_period")
+    insider_as_of = i3.date_input("Filing cutoff (as-of)", value=pd.Timestamp.today(), key="insider_as_of")
+
+    with st.expander("Optional: single-manager 13F comparison"):
+        im1, im2 = st.columns(2)
+        insider_filer_cik = im1.text_input("Manager SEC CIK", value="", key="insider_filer_cik")
+        insider_cusip = im2.text_input("Security CUSIP (9 characters)", value="", key="insider_cusip")
+
+    with st.expander("Advanced"):
+        ia1, ia2, ia3 = st.columns(3)
+        insider_track_purchases = ia1.checkbox("Show individual purchase records", key="insider_track_purchases")
+        insider_cluster_days = ia2.slider("Purchase-cluster window (calendar days)", 7, 90, 30, key="insider_cluster_days")
+        insider_cluster_buyers = ia3.slider("Purchase-cluster distinct buyers", 2, 10, 3, key="insider_cluster_buyers")
+        insider_mode = st.radio(
+            "Data source", ["Use cache when fresh (default)", "Force refresh", "Offline (cached data only)"],
+            horizontal=True, key="insider_mode",
+        )
+
+    if st.button("Run ownership analysis"):
+        if insider_previous_period >= insider_current_period:
+            st.error("Previous quarter end must be before the current quarter end.")
+            st.stop()
+
+        insider_indicator.DATA_CLIENT = insider_indicator.MassiveClient(
+            INSIDER_CACHE_DIR,
+            offline=insider_mode.startswith("Offline"),
+            refresh=insider_mode.startswith("Force"),
+            debug=False,
+        )
+        insider_args = SimpleNamespace(
+            previous_period=insider_previous_period.strftime("%Y-%m-%d"),
+            current_period=insider_current_period.strftime("%Y-%m-%d"),
+            as_of=insider_as_of.strftime("%Y-%m-%d"),
+            filer_cik=insider_filer_cik.strip() or None,
+            cusip=insider_cusip.strip() or None,
+            track_purchases=insider_track_purchases,
+            cluster_days=insider_cluster_days,
+            cluster_buyers=insider_cluster_buyers,
+        )
+        with st.spinner("Reading Form 3/4, price and (if configured) 13F from Massive..."):
+            try:
+                insider_report = insider_indicator.run_pipeline(insider_args)
+            except ValueError as e:
+                st.error(str(e))
+                insider_report = None
+
+        if insider_report:
+            result = insider_report["classification"]
+            price, form4 = insider_report["price"], insider_report["form4"]
+            stale_badge = " · ⚠️ includes stale/cached data" if result.get("uses_stale_data") else ""
+            st.subheader(f"{result['signal']}{stale_badge}")
+            st.caption(result["rule"])
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Price change (quarter)", f"{price['change_pct']:+.2f}%" if price.get("status") == "ok" else "Unavailable")
+            net = form4.get("net_insider_value") if isinstance(form4, dict) else None
+            c2.metric("Net reported P/S value", f"${net:+,.0f}" if net is not None else "Unavailable")
+            inst = insider_report["institutional"]
+            c3.metric("Selected-manager share change", f"{inst['share_change']:+,.0f}" if inst.get("status") == "ok" else inst.get("status", "not_configured").replace("_", " "))
+
+            if result.get("counterevidence"):
+                st.warning("\n".join(f"- {c}" for c in result["counterevidence"]))
+
+            if price.get("status") == "ok" and price.get("chart"):
+                chart_df = pd.DataFrame(price["chart"])
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=chart_df["day"], y=chart_df["close"], mode="lines", line=dict(color=BLUE), name="Close"))
+                fig.update_layout(**PLOTLY_LAYOUT, title=plot_title(f"COIN close - {price['start_date']} to {price['end_date']}"),
+                                   height=380, xaxis_title="Date", yaxis_title="Close ($)")
+                fig.update_xaxes(type="category", tickangle=-45, tickfont=dict(color=INK, size=11))
+                fig.update_layout(margin=dict(t=60, l=60, r=10, b=100))
+                st.plotly_chart(fig, use_container_width=True, theme=None)
+
+            st.dataframe(pd.DataFrame([
+                {"Layer": "Form 3 (initial ownership)", "Status": insider_report["form3"].get("status", "unavailable"),
+                 "Rows": insider_report["form3"].get("rows")},
+                {"Layer": "Form 4 (this quarter)", "Status": form4.get("status", "unavailable"), "Rows": form4.get("rows_fetched")},
+                {"Layer": "13F (selected manager)", "Status": inst.get("status", "not_configured"), "Rows": None},
+            ]), use_container_width=True, hide_index=True)
+
+            if insider_track_purchases and isinstance(form4, dict) and form4.get("p_purchase_tracker", {}).get("transactions"):
+                with st.expander("Individual purchase records"):
+                    st.dataframe(pd.DataFrame(form4["p_purchase_tracker"]["transactions"]), use_container_width=True, hide_index=True)
+
+            with st.expander("Full report (JSON)"):
+                st.json(insider_report)
+
+            st.caption(f"Scope: {result['scope']} · {result['interpretation']}")
